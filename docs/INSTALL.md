@@ -256,5 +256,12 @@ point setup at them with `--gguf-dir`. To let setup download from a Hugging Face
 first (Windows: `set HF_ENDPOINT=https://hf-mirror.com`, Linux: `export HF_ENDPOINT=https://hf-mirror.com`): the same
 pinned revisions and checks apply, and the MTP draft layer comes from there too.
 
+**ModelScope is a source of its own:** the same variable picks it - Windows: `set HF_ENDPOINT=https://modelscope.cn`,
+Linux: `export HF_ENDPOINT=https://modelscope.cn` - and setup downloads the same five repositories from
+modelscope.cn. Checked 2026-10-07: every file setup asks for is in them; Unsloth's shards carry the same SHA-256
+Hugging Face's do; five MTP tensors read from ModelScope (78 MB, five different shards) matched the checkpoint's
+hashes byte for byte. ModelScope's own commits are pinned, its `master` is the fallback when one is gone, and the
+checks are the same.
+
 On Linux the same options go to `./setup.sh`. `START-HERE.bat --help` lists them all. The server's own settings
 (sharing the GPU with games, MCP tools, CORS, API keys, the API itself) are in the [details](DETAILS.md#using-it).

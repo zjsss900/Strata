@@ -161,6 +161,112 @@ class HuggingFacePins(unittest.TestCase):
         self.assertIn("Downloading from https://hf-mirror.com (HF_ENDPOINT)", text)
 
 
+class ModelScope(unittest.TestCase):
+    """HF_ENDPOINT=https://modelscope.cn: the same files from modelscope.cn, at ModelScope's own pinned commits,
+    with its /models path and master as the branch a gone commit falls back to.  Mocked network."""
+
+    def test_the_endpoint_is_normalised_to_its_models_path(self):
+        repo = "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"
+        for value in ("https://modelscope.cn", "https://modelscope.cn/", "https://modelscope.cn/models",
+                      " https://modelscope.cn/models/ "):
+            with self.subTest(value=value), mock.patch.dict(setup.os.environ, {"HF_ENDPOINT": value}):
+                self.assertTrue(setup.modelscope())
+                self.assertEqual(setup.hf_endpoint(), "https://modelscope.cn/models")
+                url = setup.hf(repo)
+                self.assertEqual(url, f"https://modelscope.cn/models/{repo}/resolve/"
+                                      f"{setup.MODELSCOPE_REVISIONS[repo]}/")
+                self.assertRegex(url, SHA)                       # its own commit, still a pinned 40-hex one
+                self.assertEqual(setup.hf_unpinned(url + "x.gguf"),
+                                 f"https://modelscope.cn/models/{repo}/resolve/master/x.gguf")
+        with mock.patch.dict(setup.os.environ, {"HF_ENDPOINT": "https://hf-mirror.com"}):
+            self.assertFalse(setup.modelscope())
+            self.assertEqual(setup.hf_endpoint(), "https://hf-mirror.com")
+
+    def test_its_pins_cover_the_hf_repositories(self):
+        self.assertEqual(setup.MODELSCOPE_REVISIONS.keys(), setup.HF_REVISIONS.keys())
+        for repo, rev in setup.MODELSCOPE_REVISIONS.items():
+            with self.subTest(repo=repo):
+                self.assertRegex(rev, r"^[0-9a-f]{40}$")
+
+    def test_a_gone_commit_downloads_the_current_file(self):
+        seen = []
+
+        def urlopen(req, timeout=None):
+            seen.append((req.get_method(), req.full_url))
+            if "/resolve/master/" not in req.full_url:
+                raise not_found(req.full_url)
+            return Response(b"model bytes", status=200)
+
+        with mock.patch.dict(setup.os.environ, {"HF_ENDPOINT": "https://modelscope.cn"}), \
+                tempfile.TemporaryDirectory() as d, mock.patch.object(setup.urllib.request, "urlopen", urlopen):
+            dst = Path(d) / "m.gguf"
+            url = setup.hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF") + "m.gguf"
+            _, out = quiet(setup.download, url, dst)
+            self.assertEqual(dst.read_bytes(), b"model bytes")
+        self.assertIn("not at the pinned revision any more", out)
+        self.assertEqual([m for m, _ in seen], ["HEAD", "HEAD", "GET"])
+        self.assertTrue(all("/resolve/master/" in u for _, u in seen[1:]))
+
+    def test_the_size_of_a_file_whose_head_has_none(self):
+        """#495 as ModelScope serves it: HEAD comes back without a Content-Length, so download() asks for one byte
+        (a 206 whose Content-Range names the size) - the progress line keeps its percentage and the finished file
+        is still checked against what the server says it is."""
+        seen = []
+
+        def urlopen(req, timeout=None):
+            seen.append((req.get_method(), req.headers.get("Range")))
+            if req.get_method() == "HEAD":
+                return Response(b"")                       # 200, and no size
+            if req.headers.get("Range") == "bytes=0-0":
+                r = Response(b"x", status=206)
+                r.headers["Content-Range"] = "bytes 0-0/11"
+                return r
+            return Response(b"model bytes")
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.urllib.request, "urlopen", urlopen):
+            dst = Path(d) / "m.gguf"
+            quiet(setup.download, "https://example.com/m.gguf", dst)
+            self.assertEqual(dst.read_bytes(), b"model bytes")
+            self.assertTrue(setup.done(dst))
+        self.assertEqual(seen, [("HEAD", None), ("GET", "bytes=0-0"), ("GET", "bytes=0-")])
+
+    def test_a_server_that_ignores_the_probe_still_downloads(self):
+        """A server that answers the one-byte Range with the whole file (200): no size comes back, as before, and
+        the download completes from the stream's end."""
+        def urlopen(req, timeout=None):
+            return Response(b"" if req.get_method() == "HEAD" else b"model bytes")
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.urllib.request, "urlopen", urlopen):
+            dst = Path(d) / "m.gguf"
+            quiet(setup.download, "https://example.com/m.gguf", dst)
+            self.assertEqual(dst.read_bytes(), b"model bytes")
+            self.assertTrue(setup.done(dst))
+
+    def test_mtp_fetch_honours_modelscope(self):
+        import importlib
+        import mtp_fetch
+        try:
+            with mock.patch.dict(mtp_fetch.os.environ, {"HF_ENDPOINT": "https://modelscope.cn/"}):
+                importlib.reload(mtp_fetch)
+                self.assertTrue(mtp_fetch.MODELSCOPE)
+                self.assertEqual(mtp_fetch.HF_ENDPOINT, "https://modelscope.cn/models")
+                self.assertEqual(mtp_fetch.REPO, "https://modelscope.cn/models/Qwen/Qwen3.8-Flash-Next/resolve/"
+                                                 + mtp_fetch.MODELSCOPE_REVISION + "/")
+                self.assertTrue(mtp_fetch.pinned())             # the tensors' SHA-256 checks still apply
+
+                def urlopen(req, timeout=None):
+                    raise not_found(req.full_url)
+
+                with mock.patch.object(mtp_fetch.urllib.request, "urlopen", urlopen), \
+                        contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(mtp_fetch.resolve_repo(),
+                                     "https://modelscope.cn/models/Qwen/Qwen3.8-Flash-Next/resolve/master/")
+                self.assertIn("pinned revision", err.getvalue())
+        finally:
+            importlib.reload(mtp_fetch)
+        self.assertTrue(mtp_fetch.REPO.startswith("https://huggingface.co/"))
+
+
 class Engine(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

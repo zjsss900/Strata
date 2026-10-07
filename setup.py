@@ -16,7 +16,8 @@ What the first run does (each step is skipped when it is already done):
   4. gets the Strata engine: a ready-made build for RTX 20/30/40/50 cards (no compiler needed); if none fits your PC,
      it installs the build tools (asks first) and compiles the engine for your GPU.  AMD (--backend hip, chosen by
      itself on a PC with no usable NVIDIA card): the ready-made HIP engine on Windows, compiled here on Linux
-  5. downloads the model from Hugging Face (resumable), and the vision encoder if you want images
+  5. downloads the model from Hugging Face (resumable; HF_ENDPOINT picks a mirror or ModelScope), and the vision
+     encoder if you want images
   6. prepares the model for Strata and fetches the MTP draft layer (~5 GB, from the original Qwen checkpoint)
   7. writes run-<model>.bat / run-<model>.sh and starts the model
 
@@ -68,25 +69,48 @@ HF_REVISIONS = {
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "5348543e0147355ac9cbcb031184a3546350988e",  # 2026-09-29
     "unsloth/Qwen3.8-Flash-Next-GGUF": "38bb39ee97821de2c9009abb7e93950eec396e66",                   # 2026-09-30
 }
+# HF_ENDPOINT=https://modelscope.cn: ModelScope mirrors the same four repositories under commits of its own
+# (Hugging Face's are not there), so each is pinned to its head of the same files - checked 2026-10-07: every file
+# setup asks for is in them, Unsloth's shards carry the same SHA-256 the table above does.
+MODELSCOPE_REVISIONS = {
+    "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "1868010e27505d4b8cc15970cdcc4dd76005d7de",        # 2026-09-29
+    "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "4c1e972b4908b64730b95efa6edbfc276f688c64",   # 2026-09-24
+    "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "6e0c1d1ff6faf48b38006b0c01d42e55894c7dd5",  # 2026-09-29
+    "unsloth/Qwen3.8-Flash-Next-GGUF": "f24efa50e8adf2f1aeaeb3a7e6910e19618b4b22",                   # 2026-10-06
+}
 
 
 HF_DEFAULT = "https://huggingface.co"
 
 
+def modelscope() -> bool:
+    """Whether HF_ENDPOINT names ModelScope: it keeps its repositories under /models, pins its own commits, and
+    its default branch (master) is what a file falls back to when a pinned commit is gone."""
+    e = (os.environ.get("HF_ENDPOINT") or "").strip().rstrip("/") or HF_DEFAULT
+    return "modelscope." in e.split("//", 1)[-1].split("/", 1)[0]
+
+
 def hf_endpoint() -> str:
     """#495: the Hugging Face host - HF_ENDPOINT as huggingface_hub reads it (a mirror, e.g. https://hf-mirror.com),
-    else huggingface.co.  The pinned revisions and the SHA-256 checks are the same whichever host serves the files."""
-    return (os.environ.get("HF_ENDPOINT") or "").strip().rstrip("/") or HF_DEFAULT
+    else huggingface.co; https://modelscope.cn is ModelScope (its /models path added here).  The pinned revisions
+    and the SHA-256 checks are the same whichever host serves the files."""
+    e = (os.environ.get("HF_ENDPOINT") or "").strip().rstrip("/") or HF_DEFAULT
+    if modelscope() and not e.endswith("/models"):
+        e += "/models"
+    return e
 
 
 def hf(repo: str) -> str:
-    """The download folder of a Hugging Face repository at its pinned revision."""
-    return f"{hf_endpoint()}/{repo}/resolve/{HF_REVISIONS[repo]}/"
+    """The download folder of a repository at its pinned revision - ModelScope's own commit of it when ModelScope
+    serves the files (its mirrors do not have Hugging Face's commits)."""
+    rev = MODELSCOPE_REVISIONS[repo] if modelscope() else HF_REVISIONS[repo]
+    return f"{hf_endpoint()}/{repo}/resolve/{rev}/"
 
 
 def hf_unpinned(url: str) -> str:
-    """The same file at the repository's current revision (main)."""
-    return re.sub(r"^(https?://[^/]+/.+?/resolve/)[0-9a-f]{40}/", r"\1main/", url, count=1)
+    """The same file at the repository's current revision (main; ModelScope's default branch is master)."""
+    cur = "master" if modelscope() else "main"
+    return re.sub(r"^(https?://[^/]+/.+?/resolve/)[0-9a-f]{40}/", r"\1" + cur + "/", url, count=1)
 
 
 HF = hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF")
@@ -1151,6 +1175,19 @@ def drop_archive(z: Path) -> None:
     z.with_name(z.name + ".done").unlink(missing_ok=True)
 
 
+def url_size(url: str) -> int:
+    """The size of a file whose HEAD carries no Content-Length (ModelScope answers HEAD without one): one byte of
+    it, `Content-Range: bytes 0-0/<total>`.  0 when no size comes back - including from a server that ignores
+    Range and answers with the whole file, which is not read here."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": "bytes=0-0"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            m = re.match(r"bytes 0-0/(\d+)$", (r.headers.get("Content-Range") or "").strip())
+            return int(m.group(1)) if r.status == 206 and m else 0
+    except (urllib.error.URLError, OSError, ValueError):
+        return 0
+
+
 def download(url, dst: Path, what=None):
     """Resumable HTTP(S) download with a progress line; `file://` and plain paths are copied (tests, mirrors).
     A finished file gets a <name>.done mark, so a later run skips it without asking the server."""
@@ -1172,6 +1209,8 @@ def download(url, dst: Path, what=None):
         try:
             req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "strata-setup"})
             total = int(urllib.request.urlopen(req, timeout=60).headers.get("Content-Length", 0))
+            if not total:
+                total = url_size(url)                # a HEAD without a length: one byte names the size
             break
         except urllib.error.HTTPError as e:
             if e.code == 404 and hf_unpinned(url) != url:  # #214: the pinned revision is gone from the repository

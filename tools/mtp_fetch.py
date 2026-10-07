@@ -30,11 +30,20 @@ import urllib.request
 # on 2026-09-30), so every install reads the same tensors; STRATA_MTP_REVISION overrides it (e.g. main).  When the
 # repository no longer has it, the current files are read instead, with a message (resolve_repo).
 PINNED_REVISION = "de4b8e4d43b917e7706784d8bb445c9af86a3540"
-REVISION = os.environ.get("STRATA_MTP_REVISION") or PINNED_REVISION
-# #495: HF_ENDPOINT (a mirror, e.g. https://hf-mirror.com) serves the same revision; the SHA256 checks below still apply
+# #495: HF_ENDPOINT (a mirror, e.g. https://hf-mirror.com) serves the same revision; the SHA256 checks below still apply.
+# HF_ENDPOINT=https://modelscope.cn: ModelScope mirrors the checkpoint under commits of its own (Hugging Face's are
+# not there), so this pins its head of the same files - checked 2026-10-07, five of its tensors (78 MB) matched the
+# SHA256 below byte for byte, which the checks here keep doing for every tensor fetched.
 HF_ENDPOINT = (os.environ.get("HF_ENDPOINT") or "").strip().rstrip("/") or "https://huggingface.co"
+MODELSCOPE = "modelscope." in HF_ENDPOINT.split("//", 1)[-1].split("/", 1)[0]
+if MODELSCOPE and not HF_ENDPOINT.endswith("/models"):     # ModelScope keeps its repositories under /models
+    HF_ENDPOINT += "/models"
+MODELSCOPE_REVISION = "71abec1f006afa48ec63a77ee867e345f5dcefdd"           # its head of the checkpoint, 2026-08-27
+PIN = MODELSCOPE_REVISION if MODELSCOPE else PINNED_REVISION                # the commit this run pins
+REVISION = os.environ.get("STRATA_MTP_REVISION") or PIN
 REPO = HF_ENDPOINT + "/Qwen/Qwen3.8-Flash-Next/resolve/%s/" % REVISION
-PINNED = HF_ENDPOINT + "/Qwen/Qwen3.8-Flash-Next/resolve/%s/" % PINNED_REVISION   # SHA256's revision
+PINNED = HF_ENDPOINT + "/Qwen/Qwen3.8-Flash-Next/resolve/%s/" % PIN        # SHA256's revision
+FALLBACK = "master" if MODELSCOPE else "main"               # the default branch, when PIN is gone from the repo
 DTYPE_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "I64": 8, "I32": 4}
 BAD = 3                                             # `verify`'s exit code: a tensor is missing or corrupt
 
@@ -158,10 +167,10 @@ def resolve_repo():
                                      headers={"User-Agent": "strata-mtp-fetch"})
         urllib.request.urlopen(req, timeout=120).close()
     except urllib.error.HTTPError as e:
-        if e.code == 404 and "/resolve/main/" not in REPO:
-            print("the checkpoint's pinned revision %s is gone: reading its current files (main)" % REVISION,
+        if e.code == 404 and ("/resolve/%s/" % FALLBACK) not in REPO:
+            print("the checkpoint's pinned revision %s is gone: reading its current files (%s)" % (REVISION, FALLBACK),
                   file=sys.stderr)
-            REPO = REPO.replace("/resolve/%s/" % REVISION, "/resolve/main/")
+            REPO = REPO.replace("/resolve/%s/" % REVISION, "/resolve/%s/" % FALLBACK)
     except OSError:
         pass                                        # no answer: get() retries and reports it
     return REPO
